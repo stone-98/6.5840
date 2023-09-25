@@ -28,7 +28,6 @@ import (
 	"6.5840/labrpc"
 )
 
-
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make(). set
@@ -50,6 +49,27 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+type LogEntry struct {
+	// 任期号
+	Term int
+	// 日志条目的实体
+	Command interface{}
+}
+
+const (
+	Role_Follower  = 0 // follower role
+	Role_Candidate = 1 // candidate role
+	Role_Leader    = 2 // leader role
+)
+
+const (
+	ElectionTimeout   = time.Millisecond * 300 // 选举超时时间/心跳超时时间
+	HeartBeatInterval = time.Millisecond * 150 // leader 发送心跳
+	ApplyInterval     = time.Millisecond * 100 // apply log
+	RPCTimeout        = time.Millisecond * 100
+	MaxLockTime       = time.Millisecond * 10 // debug
+)
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -62,6 +82,41 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	// 当前服务器的角色
+	role int // current server role.
+	// 当前服务器接收到的最新任期
+	currentTerm int // latest term server has seen candidateId that received vote in current term.
+	// 当前任期内，我给谁进行了投票
+	voteFor int // candidateId that received vote in current term.
+	// 每个服务器节点上都有相应的日志条目
+	logs []LogEntry // log entries;each entry contains command for state machine, and term when entry was received by leader.
+
+	// volatile state on all servers.(所有服务器上容易丢失的状态)
+
+	// 当前服务器已知已提交的最高日志条目的索引
+	commitIndex int // index of highest log entry known to be committed.
+	// 应用到状态机的最高日志条目的索引
+	lastApplied int // index of heighest log entry applied to state machine.
+
+	// leader才拥有的状态
+
+	// 对于每个服务器，发送到该服务器的下一个日志条目的索引
+	nextIndex []int // for each server,index of the next log entry to send to that server.
+	// 对于每个服务器，已知服务器上复制的最高日志条目的索引
+	matchIndex []int // for each server,index of highest log entry known to be replicated on server.
+
+	// todo 暂时不懂含义
+	// 选举计时器
+	electionTimer *time.Timer
+	// todo 下面这些我压根不懂含义
+	appendEntriesTimers []*time.Timer
+	applyTimer          *time.Timer
+	applyCh             chan ApplyMsg
+	notifyApplyCh       chan struct{}
+	stopCh              chan struct{}
+
+	lastSnapshotIndex int // 快照中最后一条日志的index、可以理解为状态机的index
+	lastSnapshotTerm  int // 快照中最后一个任期
 }
 
 // return currentTerm and whether this server
@@ -72,6 +127,12 @@ func (rf *Raft) GetState() (int, bool) {
 	var isleader bool
 	// Your code here (2A).
 	return term, isleader
+}
+
+// 返回一个随机的超时时间，范围为 ElectionTimeout ~ 2 * ElectionTimeout
+func (rf *Raft) getElectionTimeout() time.Duration {
+	t := ElectionTimeout + time.Duration(rand.Int63())%ElectionTimeout
+	return t
 }
 
 // save Raft's persistent state to stable storage,
@@ -91,7 +152,6 @@ func (rf *Raft) persist() {
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
 }
-
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
@@ -113,7 +173,6 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
 // the service says it has created a snapshot that has
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
@@ -123,22 +182,77 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	// 候选者的任期
+	term int // candidate's term
+	// 候选者请求投票
+	candidateId int // candidate requesting vote
+	// 候选者最后一个日志条目的索引
+	lastLogIndex int // index of candidate's last log entry
+	// 候选者最后一个日志条目的任期
+	lastLogTerm int // term of candidate's last log entry
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (2A).
+	term        int
+	voteGranted bool
 }
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	lastLogTerm, lastLogIndex := rf.getLastLogTermAndIndex()
+	// 默认失败返回
+	reply.voteGranted = false
+	reply.term = rf.currentTerm
+
+	if rf.currentTerm > args.term {
+		return
+	} else if rf.currentTerm == args.lastLogTerm {
+		if rf.role == Role_Leader {
+			return
+		}
+
+		if args.candidateId == rf.voteFor {
+			reply.term = args.term
+			reply.voteGranted = true
+		}
+
+		if rf.voteFor != -1 && args.candidateId != rf.voteFor {
+			return
+		}
+		// 还未投过票
+	}
+
+	if rf.currentTerm < args.term {
+		rf.currentTerm = args.term
+		rf.changeRole(Role_Follower)
+		rf.voteFor = -1
+		reply.term = rf.currentTerm
+		rf.persist()
+	}
+
+	// 判断日志的完整性 todo 如果当前的大于请求中的lastLogIndex就直接返回失败，感觉这里有点问题的啊
+	if lastLogTerm > args.lastLogTerm || (lastLogTerm == args.lastLogTerm && lastLogIndex > args.lastLogIndex) {
+		return
+	}
+	rf.voteFor = args.candidateId
+	rf.changeRole(Role_Follower)
+
+	reply.voteGranted = true
+	reply.term = args.term
+	rf.resetElectionTimer()
+	rf.persist()
+	DPrintf("%v， role：%v，voteFor: %v", rf.me, rf.role, rf.voteFor)
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -169,10 +283,33 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
-}
+	if server < 0 || server > len(rf.peers) {
+		panic("server invalid in sendRequestVote!")
+	}
+	rpcTimer := time.NewTimer(RPCTimeout)
+	defer rpcTimer.Stop()
 
+	ch := make(chan bool, 1)
+	go func() {
+		for i := 0; i < 10; i++ {
+			ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+			if ok {
+				ch <- ok
+				return
+			} else {
+				continue
+			}
+		}
+	}()
+
+	select {
+	case <-rpcTimer.C:
+		DPrintf("%v role: %v, send request vote to peer %v TIME OUT!!!", rf.me, rf.role, server)
+		return false
+	case <-ch:
+		return true
+	}
+}
 
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -192,7 +329,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
 
 	return index, term, isLeader
 }
@@ -222,15 +358,199 @@ func (rf *Raft) ticker() {
 		// Your code here (2A)
 		// Check if a leader election should be started.
 
-
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
-		ms := 50 + (rand.Int63() % 300)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
+		// 如果当前节点等待指定时间内没有接收到leader的请求，则开始选举
+		select {
+		case <-rf.stopCh:
+			return
+		case <-rf.electionTimer.C:
+			rf.startElection()
+		}
 	}
 }
 
-// the service or tester wants to create a Raft server. the ports
+// 首先判断是否为leader，如果是leader就没必要再发起选举了
+// 修改角色为候选者
+// 分别为每个peer创建一个goroutine并且调用sendRequestVote函数发送给每一个其他节点，相应由grantedChan进行接收
+func (rf *Raft) startElection() {
+	rf.mu.Lock()
+	rf.resetElectionTimer()
+	// 已经成为leader，不需要再进行选举了
+	if rf.role == Role_Leader {
+		rf.mu.Unlock()
+		return
+	}
+	// 改变节点状态到candidate
+	rf.changeRole(Role_Candidate)
+	DPrintf("%v role %v, start election, term: %v", rf.me, rf.role, rf.currentTerm)
+	lastLogTerm, lastLogIndex := rf.getLastLogTermAndIndex()
+	args := RequestVoteArgs{
+		candidateId:  rf.me,
+		term:         rf.currentTerm,
+		lastLogTerm:  lastLogTerm,
+		lastLogIndex: lastLogIndex,
+	}
+	rf.persist()
+	rf.mu.Unlock()
+	// peers count.(所有的peers减去自己)
+	allCount := len(rf.peers)
+	grantedCount := 1
+	resCount := 1
+	grantedChan := make(chan bool, len(rf.peers))
+	for i := 0; i < allCount; i++ {
+		if i == rf.me {
+			continue
+		}
+		// 对每个peer发送rpc请求
+		go func(gch chan bool, index int) {
+			reply := RequestVoteReply{}
+			rf.sendRequestVote(index, &args, &reply)
+			gch <- reply.voteGranted
+			if reply.term > rf.currentTerm {
+				// 已有更大的任期了，放弃选举
+				rf.currentTerm = reply.term
+				rf.changeRole(Role_Follower)
+				rf.voteFor = -1
+				rf.resetElectionTimer()
+				rf.persist()
+			}
+			rf.mu.Unlock()
+		}(grantedChan, i)
+	}
+
+	// 如果当前角色是候选者
+	for rf.role == Role_Candidate {
+		flag := <-grantedChan
+		resCount++
+		if flag {
+			grantedCount++
+		}
+		DPrintf("vote: %v, allCount: %v, resCount: %v, grantedCount: %v", flag, allCount, resCount, grantedCount)
+		if grantedCount > allCount/2 {
+			// 竞选成功
+			rf.mu.Lock()
+			DPrintf("before try change to leader, count: %d, args: %+v, cuurentTerm: %v, argsTerm: %v", grantedCount, args, rf.currentTerm, args.term)
+			if rf.role == Role_Candidate && rf.currentTerm == args.term {
+				rf.changeRole(Role_Leader)
+			}
+			if rf.role == Role_Leader {
+				// ??? todo
+			}
+			rf.persist()
+			rf.mu.Unlock()
+			DPrintf("%v current role: %v", rf.me, rf.role)
+		} else if resCount == allCount || resCount-grantedCount > allCount/2 {
+			DPrintf("grant fail! grantedCount <= len/2:count:%d", grantedCount)
+			return
+		}
+	}
+}
+
+// 重置选举计时器
+func (rf *Raft) resetElectionTimer() {
+	rf.electionTimer.Stop()
+	rf.electionTimer.Reset(rf.getElectionTimeout())
+}
+
+// 返回当前状态机的最后一条日志的任期和索引
+// 索引一直递增，但是我们的日志队列却不可能无线增大，再队列中下标0存储快照
+func (rf *Raft) getLastLogTermAndIndex() (int, int) {
+	// 这个是日志最后一个数据的任期， 这个是快照最后一个任期
+	return rf.logs[len(rf.logs)-1].Term, rf.lastSnapshotIndex + len(rf.logs) - 1
+}
+
+// 改变服务器角色
+func (rf *Raft) changeRole(newRole int) {
+	if newRole < 0 || newRole > 3 {
+		panic("unknown role.")
+	}
+	rf.role = newRole
+	switch newRole {
+	case Role_Follower:
+	case Role_Candidate:
+		// 如果成为候选者
+		// 增加当前任期
+		// 投票给自己
+		// 重置选举时间
+		rf.currentTerm++
+		rf.voteFor = rf.me
+		rf.resetElectionTimer()
+	case Role_Leader:
+		// leader只有两个特殊的数据结构: nextIndex,matchIndex
+		_, lastLogIndex := rf.getLastLogTermAndIndex()
+		for i := 0; i < len(rf.peers); i++ {
+			rf.nextIndex[i] = lastLogIndex + 1
+			rf.matchIndex[i] = lastLogIndex
+		}
+		rf.resetElectionTimer()
+	default:
+		panic("unknown role")
+	}
+}
+
+type AppendEntriesArgs struct {
+	term         int        // 领导人的任期
+	leaderId     int        // 领导者的ID可以对客户端请求进行重定向（有时候客户端把请求发给了跟随着而不是领导者，则通过leaderId进行重定向）
+	prevLogIndex int        // 紧邻新日志条目之前的那个日志条目的索引
+	prevLogTerm  int        // 紧邻新日志条目之前的那个日志条目的任期
+	entries      []LogEntry // 需要被保存的日志条目
+	leaderCommit int        // 领导人已知已提交的最高的日志条目的索引
+}
+
+type AppendEntriesReply struct {
+	term      int  // 当前任期，对于领导人而言，他会更新自己的任期
+	success   bool // 如果跟随者所含的条目和preLogIndex和preLogTerm匹配上了，则为true
+	nextIndex int  // 这个应该是告知leader我需要的日志条目是多少
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rpcTimer := time.NewTimer(RPCTimeout)
+	defer rpcTimer.Stop()
+
+	ch := make(chan bool, 1)
+	go func() {
+		for i := 0; i < 10 && !rf.killed(); i++ {
+			ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+			if !ok {
+				time.Sleep(time.Millisecond * 10)
+				continue
+			} else {
+				ch <- ok
+				return
+			}
+		}
+	}()
+
+	select {
+	case <-rpcTimer.C:
+		DPrintf("%v role: %v, send append entries to peer %v TIME OUT!!!", rf.me, rf.role, server)
+		return
+	case <-ch:
+		return
+	}
+}
+
+// 目前只处理了心跳，所以不需要其他的判断
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	DPrintf("%v receive a appendEntries: %+v", rf.me, args)
+	reply.term = rf.currentTerm
+	if args.term < rf.currentTerm {
+		rf.mu.Unlock()
+		return
+	}
+	rf.currentTerm = args.term
+	rf.changeRole(Role_Follower)
+	rf.resetElectionTimer()
+	reply.success = true
+
+	rf.persist()
+	DPrintf("%v role: %v, get appendentries finish,args = %v,reply = %+v", rf.me, rf.role, *args, *reply)
+	rf.mu.Unlock()
+}
+
+// Make the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
 // have the same order. persister is a place for this server to
@@ -239,21 +559,43 @@ func (rf *Raft) ticker() {
 // tester or service expects Raft to send ApplyMsg messages.
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
+// 中文翻译：
+// peers：包含所有的节点的服务器信息
+// me: 自己节点所在的索引
+// persister：当服务器崩溃时，通过持久化恢复到崩溃之前的状态
+// applyCh：测试人员希望发送的。。。todo
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
+	DPrintf("make a rafr, me: %v", me)
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-
-	// initialize from state persisted before a crash
+	rf.role = Role_Follower
+	rf.currentTerm = 0
+	rf.voteFor = -1
+	rf.logs = make([]LogEntry, 1)
+	// 初始化...
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+	// initialize from state persisted before a crash, 读取持久化数据，暂时不进行实现
 	rf.readPersist(persister.ReadRaftState())
 
+	rf.electionTimer = time.NewTimer(rf.getElectionTimeout())
+	rf.appendEntriesTimers = make([]*time.Timer, len(rf.peers))
+	for i := 0; i < len(rf.peers); i++ {
+		rf.appendEntriesTimers[i] = time.NewTimer(HeartBeatInterval)
+	}
+	rf.applyTimer = time.NewTimer(ApplyInterval)
+	rf.applyCh = applyCh
+	rf.notifyApplyCh = make(chan struct{}, 100)
+	rf.stopCh = make(chan struct{})
 	// start ticker goroutine to start elections
 	go rf.ticker()
-
 
 	return rf
 }
