@@ -62,6 +62,19 @@ const (
 	Role_Leader    = 2 // leader role
 )
 
+func getRole(role int) string {
+	switch role {
+	case Role_Follower:
+		return "Follower"
+	case Role_Candidate:
+		return "Candidate"
+	case Role_Leader:
+		return "Leader"
+	default:
+		return "unknown"
+	}
+}
+
 const (
 	ElectionTimeout   = time.Millisecond * 300 // 选举超时时间/心跳超时时间
 	HeartBeatInterval = time.Millisecond * 150 // leader 发送心跳
@@ -105,15 +118,15 @@ type Raft struct {
 	// 对于每个服务器，已知服务器上复制的最高日志条目的索引
 	matchIndex []int // for each server,index of highest log entry known to be replicated on server.
 
-	// todo 暂时不懂含义
 	// 选举计时器
 	electionTimer *time.Timer
-	// todo 下面这些我压根不懂含义
+	// 发送日志的定时器
 	appendEntriesTimers []*time.Timer
-	applyTimer          *time.Timer
-	applyCh             chan ApplyMsg
-	notifyApplyCh       chan struct{}
-	stopCh              chan struct{}
+	// todo
+	applyTimer    *time.Timer
+	applyCh       chan ApplyMsg
+	notifyApplyCh chan struct{}
+	stopCh        chan struct{}
 
 	lastSnapshotIndex int // 快照中最后一条日志的index、可以理解为状态机的index
 	lastSnapshotTerm  int // 快照中最后一个任期
@@ -122,11 +135,11 @@ type Raft struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
-	// Your code here (2A).
-	return term, isleader
+	flag := false
+	if rf.role == Role_Leader {
+		flag = true
+	}
+	return rf.currentTerm, flag
 }
 
 // 返回一个随机的超时时间，范围为 ElectionTimeout ~ 2 * ElectionTimeout
@@ -187,21 +200,21 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	// 候选者的任期
-	term int // candidate's term
+	Term int // candidate's term
 	// 候选者请求投票
-	candidateId int // candidate requesting vote
+	CandidateId int // candidate requesting vote
 	// 候选者最后一个日志条目的索引
-	lastLogIndex int // index of candidate's last log entry
+	LastLogIndex int // index of candidate's last log entry
 	// 候选者最后一个日志条目的任期
-	lastLogTerm int // term of candidate's last log entry
+	LastLogTerm int // term of candidate's last log entry
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (2A).
-	term        int
-	voteGranted bool
+	Term        int
+	VoteGranted bool
 }
 
 // example RequestVote RPC handler.
@@ -212,47 +225,47 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	lastLogTerm, lastLogIndex := rf.getLastLogTermAndIndex()
 	// 默认失败返回
-	reply.voteGranted = false
-	reply.term = rf.currentTerm
+	reply.VoteGranted = false
+	reply.Term = rf.currentTerm
 
-	if rf.currentTerm > args.term {
+	if rf.currentTerm > args.Term {
 		return
-	} else if rf.currentTerm == args.lastLogTerm {
+	} else if rf.currentTerm == args.LastLogTerm {
 		if rf.role == Role_Leader {
 			return
 		}
 
-		if args.candidateId == rf.voteFor {
-			reply.term = args.term
-			reply.voteGranted = true
+		if args.CandidateId == rf.voteFor {
+			reply.Term = args.Term
+			reply.VoteGranted = true
 		}
 
-		if rf.voteFor != -1 && args.candidateId != rf.voteFor {
+		if rf.voteFor != -1 && args.CandidateId != rf.voteFor {
 			return
 		}
 		// 还未投过票
 	}
 
-	if rf.currentTerm < args.term {
-		rf.currentTerm = args.term
+	if rf.currentTerm < args.Term {
+		rf.currentTerm = args.Term
 		rf.changeRole(Role_Follower)
 		rf.voteFor = -1
-		reply.term = rf.currentTerm
+		reply.Term = rf.currentTerm
 		rf.persist()
 	}
 
 	// 判断日志的完整性 todo 如果当前的大于请求中的lastLogIndex就直接返回失败，感觉这里有点问题的啊
-	if lastLogTerm > args.lastLogTerm || (lastLogTerm == args.lastLogTerm && lastLogIndex > args.lastLogIndex) {
+	if lastLogTerm > args.LastLogTerm || (lastLogTerm == args.LastLogTerm && lastLogIndex > args.LastLogTerm) {
 		return
 	}
-	rf.voteFor = args.candidateId
+	rf.voteFor = args.CandidateId
 	rf.changeRole(Role_Follower)
 
-	reply.voteGranted = true
-	reply.term = args.term
+	reply.VoteGranted = true
+	reply.Term = args.Term
 	rf.resetElectionTimer()
 	rf.persist()
-	DPrintf("%v， role：%v，voteFor: %v", rf.me, rf.role, rf.voteFor)
+	DPrintf("me: %v role：%v, voteFor: %v", rf.me, getRole(rf.role), rf.voteFor)
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -304,7 +317,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 	select {
 	case <-rpcTimer.C:
-		DPrintf("%v role: %v, send request vote to peer %v TIME OUT!!!", rf.me, rf.role, server)
+		DPrintf("%v role: %v, send request vote to peer %v TIME OUT!!!", rf.me, getRole(rf.role), server)
 		return false
 	case <-ch:
 		return true
@@ -353,20 +366,40 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) ticker() {
-	for rf.killed() == false {
+	// 选举定时
+	go func() {
+		for rf.killed() == false {
 
-		// Your code here (2A)
-		// Check if a leader election should be started.
+			// Your code here (2A)
+			// Check if a leader election should be started.
 
-		// pause for a random amount of time between 50 and 350
-		// milliseconds.
-		// 如果当前节点等待指定时间内没有接收到leader的请求，则开始选举
-		select {
-		case <-rf.stopCh:
-			return
-		case <-rf.electionTimer.C:
-			rf.startElection()
+			// pause for a random amount of time between 50 and 350
+			// milliseconds.
+			// 如果当前节点等待指定时间内没有接收到leader的请求，则开始选举
+			select {
+			case <-rf.stopCh:
+				return
+			case <-rf.electionTimer.C:
+				rf.startElection()
+			}
 		}
+	}()
+
+	//leader发送日志定时
+	for i, _ := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		go func(cur int) {
+			for rf.killed() == false {
+				select {
+				case <-rf.stopCh:
+					return
+				case <-rf.appendEntriesTimers[cur].C:
+					rf.sendAppendEntriesToPeer(cur)
+				}
+			}
+		}(i)
 	}
 }
 
@@ -383,13 +416,13 @@ func (rf *Raft) startElection() {
 	}
 	// 改变节点状态到candidate
 	rf.changeRole(Role_Candidate)
-	DPrintf("%v role %v, start election, term: %v", rf.me, rf.role, rf.currentTerm)
+	DPrintf("me: %v role %v, start election, term: %v", rf.me, getRole(rf.role), rf.currentTerm)
 	lastLogTerm, lastLogIndex := rf.getLastLogTermAndIndex()
 	args := RequestVoteArgs{
-		candidateId:  rf.me,
-		term:         rf.currentTerm,
-		lastLogTerm:  lastLogTerm,
-		lastLogIndex: lastLogIndex,
+		CandidateId:  rf.me,
+		Term:         rf.currentTerm,
+		LastLogTerm:  lastLogTerm,
+		LastLogIndex: lastLogIndex,
 	}
 	rf.persist()
 	rf.mu.Unlock()
@@ -406,10 +439,11 @@ func (rf *Raft) startElection() {
 		go func(gch chan bool, index int) {
 			reply := RequestVoteReply{}
 			rf.sendRequestVote(index, &args, &reply)
-			gch <- reply.voteGranted
-			if reply.term > rf.currentTerm {
+			gch <- reply.VoteGranted
+			rf.mu.Lock()
+			if reply.Term > rf.currentTerm {
 				// 已有更大的任期了，放弃选举
-				rf.currentTerm = reply.term
+				rf.currentTerm = reply.Term
 				rf.changeRole(Role_Follower)
 				rf.voteFor = -1
 				rf.resetElectionTimer()
@@ -426,29 +460,37 @@ func (rf *Raft) startElection() {
 		if flag {
 			grantedCount++
 		}
-		DPrintf("vote: %v, allCount: %v, resCount: %v, grantedCount: %v", flag, allCount, resCount, grantedCount)
+		DPrintf("me: %v vote: %v, allCount: %v, resCount: %v, grantedCount: %v", rf.me, flag, allCount, resCount, grantedCount)
 		if grantedCount > allCount/2 {
 			// 竞选成功
 			rf.mu.Lock()
-			DPrintf("before try change to leader, count: %d, args: %+v, cuurentTerm: %v, argsTerm: %v", grantedCount, args, rf.currentTerm, args.term)
-			if rf.role == Role_Candidate && rf.currentTerm == args.term {
+			DPrintf("me: %v before try change to leader, count: %d, args: %+v, currentTerm: %v, argsTerm: %v", rf.me, grantedCount, args, rf.currentTerm, args.Term)
+			if rf.role == Role_Candidate && rf.currentTerm == args.Term {
 				rf.changeRole(Role_Leader)
 			}
 			if rf.role == Role_Leader {
-				// ??? todo
+				rf.resetAppendEntriesTimersZero()
 			}
 			rf.persist()
 			rf.mu.Unlock()
-			DPrintf("%v current role: %v", rf.me, rf.role)
+			DPrintf("me: %v current role: %v", rf.me, getRole(rf.role))
 		} else if resCount == allCount || resCount-grantedCount > allCount/2 {
-			DPrintf("grant fail! grantedCount <= len/2:count:%d", grantedCount)
+			DPrintf("me: %v grant fail! grantedCount <= len/2:count:%d", rf.me, grantedCount)
 			return
 		}
 	}
 }
 
+func (rf *Raft) resetAppendEntriesTimersZero() {
+	for _, timer := range rf.appendEntriesTimers {
+		timer.Stop()
+		timer.Reset(0)
+	}
+}
+
 // 重置选举计时器
 func (rf *Raft) resetElectionTimer() {
+	DPrintf("me: %v reset election timer.", rf.me)
 	rf.electionTimer.Stop()
 	rf.electionTimer.Reset(rf.getElectionTimeout())
 }
@@ -490,18 +532,97 @@ func (rf *Raft) changeRole(newRole int) {
 }
 
 type AppendEntriesArgs struct {
-	term         int        // 领导人的任期
-	leaderId     int        // 领导者的ID可以对客户端请求进行重定向（有时候客户端把请求发给了跟随着而不是领导者，则通过leaderId进行重定向）
-	prevLogIndex int        // 紧邻新日志条目之前的那个日志条目的索引
-	prevLogTerm  int        // 紧邻新日志条目之前的那个日志条目的任期
-	entries      []LogEntry // 需要被保存的日志条目
-	leaderCommit int        // 领导人已知已提交的最高的日志条目的索引
+	Term         int        // 领导人的任期
+	LeaderId     int        // 领导者的ID可以对客户端请求进行重定向（有时候客户端把请求发给了跟随着而不是领导者，则通过leaderId进行重定向）
+	PrevLogIndex int        // 紧邻新日志条目之前的那个日志条目的索引
+	PrevLogTerm  int        // 紧邻新日志条目之前的那个日志条目的任期
+	Entries      []LogEntry // 需要被保存的日志条目
+	LeaderCommit int        // 领导人已知已提交的最高的日志条目的索引
 }
 
 type AppendEntriesReply struct {
-	term      int  // 当前任期，对于领导人而言，他会更新自己的任期
-	success   bool // 如果跟随者所含的条目和preLogIndex和preLogTerm匹配上了，则为true
-	nextIndex int  // 这个应该是告知leader我需要的日志条目是多少
+	Term      int  // 当前任期，对于领导人而言，他会更新自己的任期
+	Success   bool // 如果跟随者所含的条目和preLogIndex和preLogTerm匹配上了，则为true
+	NextIndex int  // 这个应该是告知leader我需要的日志条目是多少
+}
+
+// 获取要向指定节点发送的日志
+func (rf *Raft) getAppendLogs(peerId int) (prevLogIndex int, prevLogTerm int, logEntries []LogEntry) {
+	nextIndex := rf.nextIndex[peerId]
+	lastLogTerm, lastLogIndex := rf.getLastLogTermAndIndex()
+	// 如果下一个需要发送的索引小于或等于快照中下一个索引或者下一个索引
+	// 下一个需要发送的索引大于
+	if nextIndex <= rf.lastSnapshotIndex || nextIndex > lastLogIndex {
+		// 没有要发送的log
+		prevLogTerm = lastLogTerm
+		prevLogIndex = lastLogIndex
+		return
+	}
+	logEntries = make([]LogEntry, lastLogIndex-nextIndex+1)
+	copy(logEntries, rf.logs[nextIndex-rf.lastSnapshotIndex:])
+	prevLogIndex = nextIndex - 1
+	if prevLogIndex == rf.lastSnapshotIndex {
+		prevLogTerm = rf.lastSnapshotTerm
+	} else {
+		prevLogTerm = rf.logs[prevLogIndex-rf.lastSnapshotIndex].Term
+	}
+	return
+}
+
+// 重置timer
+func (rf *Raft) resetAppendEntriesTimer(peerId int) {
+	rf.appendEntriesTimers[peerId].Stop()
+	rf.appendEntriesTimers[peerId].Reset(HeartBeatInterval)
+}
+
+// 当选举leader成功了，那么则定时发送心跳
+func (rf *Raft) sendAppendEntriesToPeer(peerId int) {
+	if rf.killed() {
+		return
+	}
+	rf.mu.Lock()
+	if rf.role != Role_Leader {
+		// 如果说我不是leader我就重置
+		rf.resetAppendEntriesTimer(peerId)
+		rf.mu.Unlock()
+		return
+	}
+	DPrintf("me: %v send append entries to peer %v", rf.me, peerId)
+	prevLogIndex, prevLogTerm, logEntries := rf.getAppendLogs(peerId)
+	args := AppendEntriesArgs{
+		Term:         rf.currentTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		Entries:      logEntries,
+		LeaderCommit: rf.commitIndex,
+	}
+	reply := AppendEntriesReply{}
+	rf.resetAppendEntriesTimer(peerId)
+	rf.mu.Unlock()
+	//发送rpc
+	rf.sendAppendEntries(peerId, &args, &reply)
+
+	DPrintf("me: %v role: %v, send append entries to peer finish,%v,args = %+v,reply = %+v", rf.me, getRole(rf.role), peerId, args, reply)
+
+	rf.mu.Lock()
+	if reply.Term > rf.currentTerm {
+		rf.changeRole(Role_Follower)
+		rf.currentTerm = reply.Term
+		rf.resetElectionTimer()
+		rf.persist()
+		rf.mu.Unlock()
+		return
+	}
+
+	if rf.role != Role_Leader || rf.currentTerm != args.Term {
+		rf.mu.Unlock()
+		return
+	}
+
+	//如果有日志的话，接下来要做的是对日志进行处理，这里暂时可以不用写
+	rf.mu.Unlock()
+	return
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -534,19 +655,19 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // 目前只处理了心跳，所以不需要其他的判断
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
-	DPrintf("%v receive a appendEntries: %+v", rf.me, args)
-	reply.term = rf.currentTerm
-	if args.term < rf.currentTerm {
+	DPrintf("me: %v receive a appendEntries: %+v", rf.me, args)
+	reply.Term = rf.currentTerm
+	if args.Term < rf.currentTerm {
 		rf.mu.Unlock()
 		return
 	}
-	rf.currentTerm = args.term
+	rf.currentTerm = args.Term
 	rf.changeRole(Role_Follower)
 	rf.resetElectionTimer()
-	reply.success = true
+	reply.Success = true
 
 	rf.persist()
-	DPrintf("%v role: %v, get appendentries finish,args = %v,reply = %+v", rf.me, rf.role, *args, *reply)
+	DPrintf("me: %v role: %v, get appendentries finish,args = %v,reply = %+v", rf.me, getRole(rf.role), *args, *reply)
 	rf.mu.Unlock()
 }
 
