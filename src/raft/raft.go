@@ -128,7 +128,7 @@ type Raft struct {
 	notifyApplyCh chan struct{}
 	stopCh        chan struct{}
 
-	lastSnapshotIndex int // 快照中最后一条日志的index、可以理解为状态机的index
+	lastSnapshotIndex int // 快照中最后一条日志的index，是真正的index，不是存储在logs中的index
 	lastSnapshotTerm  int // 快照中最后一个任期
 }
 
@@ -254,8 +254,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.persist()
 	}
 
-	// 判断日志的完整性 todo 如果当前的大于请求中的lastLogIndex就直接返回失败，感觉这里有点问题的啊
-	if lastLogTerm > args.LastLogTerm || (lastLogTerm == args.LastLogTerm && lastLogIndex > args.LastLogTerm) {
+	// 判断日志的完整性
+	if lastLogTerm > args.LastLogTerm || (lastLogTerm == args.LastLogTerm && lastLogIndex > args.LastLogIndex) {
 		return
 	}
 	rf.voteFor = args.CandidateId
@@ -552,6 +552,7 @@ func (rf *Raft) getAppendLogs(peerId int) (prevLogIndex int, prevLogTerm int, lo
 	lastLogTerm, lastLogIndex := rf.getLastLogTermAndIndex()
 	// 如果下一个需要发送的索引小于或等于快照中下一个索引或者下一个索引
 	// 下一个需要发送的索引大于
+	// todo 我并不知道这个判断有何意义
 	if nextIndex <= rf.lastSnapshotIndex || nextIndex > lastLogIndex {
 		// 没有要发送的log
 		prevLogTerm = lastLogTerm
@@ -656,7 +657,9 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	DPrintf("me: %v receive a appendEntries: %+v", rf.me, args)
+	// 默认响应失败
 	reply.Term = rf.currentTerm
+	reply.Success = false
 	if args.Term < rf.currentTerm {
 		rf.mu.Unlock()
 		return
