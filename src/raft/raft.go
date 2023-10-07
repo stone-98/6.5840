@@ -122,7 +122,7 @@ type Raft struct {
 	electionTimer *time.Timer
 	// 发送日志的定时器
 	appendEntriesTimers []*time.Timer
-	// todo
+	// 应用定时器
 	applyTimer    *time.Timer
 	applyCh       chan ApplyMsg
 	notifyApplyCh chan struct{}
@@ -342,6 +342,28 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// 如果当前角色不是leader，则直接返回
+	if rf.role != Role_Leader {
+		return index, term, isLeader
+	}
+
+	// 将待提交的命令追加到logs中
+	rf.logs = append(rf.logs, LogEntry{
+		Term:    rf.currentTerm,
+		Command: command,
+	})
+	_, lastIndex := rf.getLastLogTermAndIndex()
+	index = lastIndex
+	rf.matchIndex[rf.me] = lastIndex
+	rf.nextIndex[rf.me] = lastIndex + 1
+
+	term = rf.currentTerm
+	isLeader = true
+	// 立马发送日志请求
+	rf.resetAppendEntriesTimersZero()
 
 	return index, term, isLeader
 }
@@ -366,6 +388,22 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) ticker() {
+	// 处理ApplyCh，定时调用startApplyLogs应用日志
+	go func() {
+		for {
+			select {
+			case <-rf.stopCh:
+				// 如果应用停止了，直接返回
+				return
+			case <-rf.applyTimer.C:
+				// 通知进行应用
+				rf.notifyApplyCh <- struct{}{}
+			case <-rf.notifyApplyCh: //当有日志记录提交了，要进行应用
+				rf.startApplyLogs()
+			}
+		}
+	}()
+
 	// 选举定时
 	go func() {
 		for rf.killed() == false {
@@ -400,6 +438,40 @@ func (rf *Raft) ticker() {
 				}
 			}
 		}(i)
+	}
+}
+
+// 处理要应用的日志，快照的命令比较特殊，不在这里提交
+func (rf *Raft) startApplyLogs() {
+	defer rf.applyTimer.Reset(ApplyInterval)
+
+	rf.mu.Lock()
+	var msgs []ApplyMsg
+	if rf.lastApplied < rf.lastSnapshotIndex {
+		// todo lastApplied不应该小于lastSnapshotIndex，我不知道这里为何要做这个判断~~~
+		// 此时要安装快照，命令在接收到快照时就发布过了，等待处理
+		msgs = make([]ApplyMsg, 0)
+	} else if rf.commitIndex <= rf.lastApplied {
+		// 代表在快照之后没有新的日志被提交，这可能是没有足够多的节点达成一致，无法提交新的日志，
+		// 在这种情况下，没有需要应用的新日志，所以将msgs的切片设置为空，不进行日志的应用操作
+		msgs = make([]ApplyMsg, 0)
+	} else {
+		msgs = make([]ApplyMsg, 0, rf.commitIndex-rf.lastApplied)
+		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+			msgs = append(msgs, ApplyMsg{
+				CommandValid: true,
+				Command:      rf.logs[rf.getStoreIndexByLogIndex(i)].Command,
+				CommandIndex: i,
+			})
+		}
+	}
+	rf.mu.Unlock()
+
+	for _, msg := range msgs {
+		rf.applyCh <- msg
+		rf.mu.Lock()
+		rf.lastApplied = msg.CommandIndex
+		rf.mu.Unlock()
 	}
 }
 
@@ -481,11 +553,41 @@ func (rf *Raft) startElection() {
 	}
 }
 
+//判断当前raft的日志记录是否超过发送过来的日志记录
+func (rf *Raft) isOutOfArgsAppendEntries(args *AppendEntriesArgs) bool {
+	argsLastLogIndex := args.PrevLogIndex + len(args.Entries)
+	lastLogTerm, lastLogIndex := rf.getLastLogTermAndIndex()
+	if lastLogTerm == args.Term && argsLastLogIndex < lastLogIndex {
+		return true
+	}
+	return false
+}
+
+//获取当前存储位置的索引
+func (rf *Raft) getStoreIndexByLogIndex(logIndex int) int {
+	storeIndex := logIndex - rf.lastSnapshotIndex
+	if storeIndex < 0 {
+		return -1
+	}
+	return storeIndex
+}
+
 func (rf *Raft) resetAppendEntriesTimersZero() {
 	for _, timer := range rf.appendEntriesTimers {
 		timer.Stop()
 		timer.Reset(0)
 	}
+}
+
+func (rf *Raft) resetAppendEntriesTimerZero(peerId int) {
+	rf.appendEntriesTimers[peerId].Stop()
+	rf.appendEntriesTimers[peerId].Reset(0)
+}
+
+//重置单个timer
+func (rf *Raft) resetAppendEntriesTimer(peerId int) {
+	rf.appendEntriesTimers[peerId].Stop()
+	rf.appendEntriesTimers[peerId].Reset(HeartBeatInterval)
 }
 
 // 重置选举计时器
@@ -541,9 +643,10 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term      int  // 当前任期，对于领导人而言，他会更新自己的任期
-	Success   bool // 如果跟随者所含的条目和preLogIndex和preLogTerm匹配上了，则为true
-	NextIndex int  // 这个应该是告知leader我需要的日志条目是多少
+	Term         int  // 当前任期，对于领导人而言，他会更新自己的任期
+	Success      bool // 如果跟随者所含的条目和preLogIndex和preLogTerm匹配上了，则为true
+	NextLogTerm  int  // 下一个需要接收的任期
+	NextLogIndex int  // 下一个需要接收的索引
 }
 
 // 获取要向指定节点发送的日志
@@ -568,12 +671,6 @@ func (rf *Raft) getAppendLogs(peerId int) (prevLogIndex int, prevLogTerm int, lo
 		prevLogTerm = rf.logs[prevLogIndex-rf.lastSnapshotIndex].Term
 	}
 	return
-}
-
-// 重置timer
-func (rf *Raft) resetAppendEntriesTimer(peerId int) {
-	rf.appendEntriesTimers[peerId].Stop()
-	rf.appendEntriesTimers[peerId].Reset(HeartBeatInterval)
 }
 
 // 当选举leader成功了，那么则定时发送心跳
@@ -621,9 +718,74 @@ func (rf *Raft) sendAppendEntriesToPeer(peerId int) {
 		return
 	}
 
-	//如果有日志的话，接下来要做的是对日志进行处理，这里暂时可以不用写
+	//接收成功，两种情况
+	//1:发送的数据全部接收了
+	//2:根本没有数据
+	if reply.Success {
+		// 如果需要接收的索引大于下一个索引，那么需要进行更新，todo 这种情况会发生嘛？
+		if reply.NextLogIndex > rf.nextIndex[peerId] {
+			rf.nextIndex[peerId] = reply.NextLogIndex
+			rf.matchIndex[peerId] = reply.NextLogIndex - 1
+		}
+		// 不能单独提交之前任期的日志，并且最后一个任期必须是当前任期
+		if len(args.Entries) > 0 && args.Entries[len(args.Entries)-1].Term == rf.currentTerm {
+			rf.tryCommitLog()
+		}
+		// 持久化
+		rf.persist()
+		rf.mu.Unlock()
+		return
+	}
+
+	// 接收失败了
+	if reply.NextLogIndex != 0 {
+		if reply.NextLogIndex > rf.lastSnapshotIndex {
+			// 如果需要的下一个索引大于快照中的索引，那么更新nextIndex的信息
+			rf.nextIndex[peerId] = reply.NextLogIndex
+			// 然后立马重新发送
+			rf.resetAppendEntriesTimerZero(peerId)
+		} else {
+			// 否则发送快照
+			go rf.sendInstallSnapshotToPeer(peerId)
+		}
+		rf.mu.Unlock()
+		return
+	} else {
+		//reply.NextLogIndex = 0,此时如果插入会导致乱序，可以不进行处理
+	}
+
 	rf.mu.Unlock()
 	return
+}
+
+//尝试去提交日志
+//会依次判断，可以提交多个，但不能有间断
+func (rf *Raft) tryCommitLog() {
+	_, lastLogIndex := rf.getLastLogTermAndIndex()
+	hasCommit := false
+
+	for i := rf.commitIndex + 1; i <= lastLogIndex; i++ {
+		count := 0
+		for _, m := range rf.matchIndex {
+			if m >= i {
+				count += 1
+				//提交数达到多数派
+				if count > len(rf.peers)/2 {
+					rf.commitIndex = i
+					hasCommit = true
+					DPrintf("%v role: %v,commit index %v", rf.me, rf.role, i)
+					break
+				}
+			}
+		}
+		if rf.commitIndex != i {
+			break
+		}
+	}
+
+	if hasCommit {
+		rf.notifyApplyCh <- struct{}{}
+	}
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -667,11 +829,65 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.currentTerm = args.Term
 	rf.changeRole(Role_Follower)
 	rf.resetElectionTimer()
-	reply.Success = true
+	_, lastLogIndex := rf.getLastLogTermAndIndex()
+	//先判断两边，再判断刚好从快照开始，再判断中间的情况
+	if args.PrevLogIndex < rf.lastSnapshotIndex {
+		//1.要插入的前一个index小于快照index，几乎不会发生
+		reply.Success = false
+		reply.NextLogIndex = rf.lastSnapshotIndex + 1
+	} else if args.PrevLogIndex > lastLogIndex {
+		//2. 要插入的前一个index大于最后一个log的index，说明中间还有log
+		reply.Success = false
+		reply.NextLogIndex = lastLogIndex + 1
+	} else if args.PrevLogIndex == rf.lastSnapshotIndex {
+		//3. 要插入的前一个index刚好等于快照的index，说明可以全覆盖，但要判断是否是全覆盖
+		if rf.isOutOfArgsAppendEntries(args) {
+			reply.Success = false
+			reply.NextLogIndex = 0 //=0代表着插入会导致乱序
+		} else {
+			reply.Success = true
+			rf.logs = append(rf.logs[:1], args.Entries...)
+			_, currentLogIndex := rf.getLastLogTermAndIndex()
+			reply.NextLogIndex = currentLogIndex + 1
+		}
+	} else if args.PrevLogTerm == rf.logs[rf.getStoreIndexByLogIndex(args.PrevLogIndex)].Term {
+		//4. 中间的情况：索引处的两个term相同
+		if rf.isOutOfArgsAppendEntries(args) {
+			reply.Success = false
+			reply.NextLogIndex = 0
+		} else {
+			reply.Success = true
+			rf.logs = append(rf.logs[:rf.getStoreIndexByLogIndex(args.PrevLogIndex)+1], args.Entries...)
+			_, currentLogIndex := rf.getLastLogTermAndIndex()
+			reply.NextLogIndex = currentLogIndex + 1
+		}
+	} else {
+		//5. 中间的情况：索引处的两个term不相同，跳过一个term
+		term := rf.logs[rf.getStoreIndexByLogIndex(args.PrevLogIndex)].Term
+		index := args.PrevLogIndex
+		for index > rf.commitIndex && index > rf.lastSnapshotIndex && rf.logs[rf.getStoreIndexByLogIndex(index)].Term == term {
+			index--
+		}
+		reply.Success = false
+		reply.NextLogIndex = index + 1
+	}
+
+	//判断是否有提交数据
+	if reply.Success {
+		DPrintf("%v current commit: %v, try to commit %v", rf.me, rf.commitIndex, args.LeaderCommit)
+		if rf.commitIndex < args.LeaderCommit {
+			rf.commitIndex = args.LeaderCommit
+			rf.notifyApplyCh <- struct{}{}
+		}
+	}
 
 	rf.persist()
 	DPrintf("me: %v role: %v, get appendentries finish,args = %v,reply = %+v", rf.me, getRole(rf.role), *args, *reply)
 	rf.mu.Unlock()
+}
+
+func (rf *Raft) sendInstallSnapshotToPeer(id int) {
+	// todo ...
 }
 
 // Make the service or tester wants to create a Raft server. the ports
