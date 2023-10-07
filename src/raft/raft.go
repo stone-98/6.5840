@@ -123,10 +123,13 @@ type Raft struct {
 	// 发送日志的定时器
 	appendEntriesTimers []*time.Timer
 	// 应用定时器
-	applyTimer    *time.Timer
-	applyCh       chan ApplyMsg
+	applyTimer *time.Timer
+	// 应用channel
+	applyCh chan ApplyMsg
+	// 通知应用channel
 	notifyApplyCh chan struct{}
-	stopCh        chan struct{}
+	// 停止channel
+	stopCh chan struct{}
 
 	lastSnapshotIndex int // 快照中最后一条日志的index，是真正的index，不是存储在logs中的index
 	lastSnapshotTerm  int // 快照中最后一个任期
@@ -398,7 +401,8 @@ func (rf *Raft) ticker() {
 			case <-rf.applyTimer.C:
 				// 通知进行应用
 				rf.notifyApplyCh <- struct{}{}
-			case <-rf.notifyApplyCh: //当有日志记录提交了，要进行应用
+			case <-rf.notifyApplyCh:
+				// 当有日志记录提交了，要进行应用
 				rf.startApplyLogs()
 			}
 		}
@@ -553,7 +557,7 @@ func (rf *Raft) startElection() {
 	}
 }
 
-//判断当前raft的日志记录是否超过发送过来的日志记录
+// 判断当前raft的日志记录是否超过发送过来的日志记录
 func (rf *Raft) isOutOfArgsAppendEntries(args *AppendEntriesArgs) bool {
 	argsLastLogIndex := args.PrevLogIndex + len(args.Entries)
 	lastLogTerm, lastLogIndex := rf.getLastLogTermAndIndex()
@@ -673,14 +677,14 @@ func (rf *Raft) getAppendLogs(peerId int) (prevLogIndex int, prevLogTerm int, lo
 	return
 }
 
-// 当选举leader成功了，那么则定时发送心跳
+// 发送日志请求到接收方（包含心跳）
 func (rf *Raft) sendAppendEntriesToPeer(peerId int) {
 	if rf.killed() {
 		return
 	}
 	rf.mu.Lock()
+	// 如果说我不是leader，那么我直接重置发送日志请求的定时任务
 	if rf.role != Role_Leader {
-		// 如果说我不是leader我就重置
 		rf.resetAppendEntriesTimer(peerId)
 		rf.mu.Unlock()
 		return
@@ -718,16 +722,16 @@ func (rf *Raft) sendAppendEntriesToPeer(peerId int) {
 		return
 	}
 
-	//接收成功，两种情况
-	//1:发送的数据全部接收了
-	//2:根本没有数据
+	// 接收成功，两种情况
+	// - 发送的数据全部接收了
+	// - 根本没有数据
 	if reply.Success {
-		// 如果需要接收的索引大于下一个索引，那么需要进行更新，todo 这种情况会发生嘛？
+		// 如果需要接收的索引大于下一个索引，那么需要进行更新，这种情况就是PrevLogIndex < lastSnapshotIndex这种情况
 		if reply.NextLogIndex > rf.nextIndex[peerId] {
 			rf.nextIndex[peerId] = reply.NextLogIndex
 			rf.matchIndex[peerId] = reply.NextLogIndex - 1
 		}
-		// 不能单独提交之前任期的日志，并且最后一个任期必须是当前任期
+		// 不能单独提交之前任期的日志，如果要提交的话最后一个任期必须是当前任期
 		if len(args.Entries) > 0 && args.Entries[len(args.Entries)-1].Term == rf.currentTerm {
 			rf.tryCommitLog()
 		}
@@ -758,8 +762,7 @@ func (rf *Raft) sendAppendEntriesToPeer(peerId int) {
 	return
 }
 
-//尝试去提交日志
-//会依次判断，可以提交多个，但不能有间断
+// 尝试去提交日志，会依次判断，可以提交多个，但不能有间断
 func (rf *Raft) tryCommitLog() {
 	_, lastLogIndex := rf.getLastLogTermAndIndex()
 	hasCommit := false
@@ -769,7 +772,7 @@ func (rf *Raft) tryCommitLog() {
 		for _, m := range rf.matchIndex {
 			if m >= i {
 				count += 1
-				//提交数达到多数派
+				// 如果提交数达到多数派，那么将提交
 				if count > len(rf.peers)/2 {
 					rf.commitIndex = i
 					hasCommit = true
@@ -815,13 +818,14 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	}
 }
 
-// 目前只处理了心跳，所以不需要其他的判断
+// AppendEntries 处理日志请求（包含了心跳和日志追加）
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	DPrintf("me: %v receive a appendEntries: %+v", rf.me, args)
 	// 默认响应失败
 	reply.Term = rf.currentTerm
 	reply.Success = false
+	// 如果比当前任期还小，那么直接返回
 	if args.Term < rf.currentTerm {
 		rf.mu.Unlock()
 		return
@@ -830,20 +834,23 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.changeRole(Role_Follower)
 	rf.resetElectionTimer()
 	_, lastLogIndex := rf.getLastLogTermAndIndex()
-	//先判断两边，再判断刚好从快照开始，再判断中间的情况
 	if args.PrevLogIndex < rf.lastSnapshotIndex {
-		//1.要插入的前一个index小于快照index，几乎不会发生
+		// 1.要插入的前一个index小于快照index(几乎不会发生)
+		// 肯定是返回false，因为我们需要的下一个日志索引起码要是从日志索引+1开始
 		reply.Success = false
 		reply.NextLogIndex = rf.lastSnapshotIndex + 1
 	} else if args.PrevLogIndex > lastLogIndex {
-		//2. 要插入的前一个index大于最后一个log的index，说明中间还有log
+		// 2. 要插入的前一个index大于最后一个log的index，说明中间还有日志
+		// 中间还有日志，所以返回false，我们应该需要lastLogIndex + 1，为NextLogIndex
 		reply.Success = false
 		reply.NextLogIndex = lastLogIndex + 1
 	} else if args.PrevLogIndex == rf.lastSnapshotIndex {
-		//3. 要插入的前一个index刚好等于快照的index，说明可以全覆盖，但要判断是否是全覆盖
+		// 3. 要插入的前一个index刚好等于快照的index，需要进行判断分别有两种情况
+		// - 如果说当前的日志超出了参数中的日志，那么则返回false，并且将NextLogIndex置为0，代表插入会导致乱序
+		// - 如果说当前的日志没有超出参数中的日志，那么相当于可以全覆盖掉，那么直接追加到logs中
 		if rf.isOutOfArgsAppendEntries(args) {
 			reply.Success = false
-			reply.NextLogIndex = 0 //=0代表着插入会导致乱序
+			reply.NextLogIndex = 0
 		} else {
 			reply.Success = true
 			rf.logs = append(rf.logs[:1], args.Entries...)
@@ -851,7 +858,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.NextLogIndex = currentLogIndex + 1
 		}
 	} else if args.PrevLogTerm == rf.logs[rf.getStoreIndexByLogIndex(args.PrevLogIndex)].Term {
-		//4. 中间的情况：索引处的两个term相同
+		// 4. 如果说PrevLogTerm和当前日志最后一个任期是相同的，分别也有两种情况
+		// - 如果说当前的日志超出了参数中的日志，那么则返回false，并且将NextLogIndex置为0，代表插入会导致乱序
+		// - 如果说当前的日志没有超出参数中的日志，那么相当于可以全覆盖掉，那么直接追加到logs中
 		if rf.isOutOfArgsAppendEntries(args) {
 			reply.Success = false
 			reply.NextLogIndex = 0
@@ -862,7 +871,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.NextLogIndex = currentLogIndex + 1
 		}
 	} else {
-		//5. 中间的情况：索引处的两个term不相同，跳过一个term
+		// 5. 如果说任期不相等，那么则往前退一个任期，再响应给发送方，由发送方重新发起
 		term := rf.logs[rf.getStoreIndexByLogIndex(args.PrevLogIndex)].Term
 		index := args.PrevLogIndex
 		for index > rf.commitIndex && index > rf.lastSnapshotIndex && rf.logs[rf.getStoreIndexByLogIndex(index)].Term == term {
@@ -872,7 +881,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.NextLogIndex = index + 1
 	}
 
-	//判断是否有提交数据
+	// 如果说接收成功了，那么判断是否有提交数据，如果有提交数据，那么进行提交
 	if reply.Success {
 		DPrintf("%v current commit: %v, try to commit %v", rf.me, rf.commitIndex, args.LeaderCommit)
 		if rf.commitIndex < args.LeaderCommit {
@@ -902,8 +911,8 @@ func (rf *Raft) sendInstallSnapshotToPeer(id int) {
 // 中文翻译：
 // peers：包含所有的节点的服务器信息
 // me: 自己节点所在的索引
-// persister：当服务器崩溃时，通过持久化恢复到崩溃之前的状态
-// applyCh：测试人员希望发送的。。。todo
+// persister:当服务器崩溃时，通过持久化恢复到崩溃之前的状态
+// applyCh:应用日志的channel
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	DPrintf("make a rafr, me: %v", me)
